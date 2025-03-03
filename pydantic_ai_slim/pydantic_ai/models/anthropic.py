@@ -2,13 +2,14 @@ from __future__ import annotations as _annotations
 
 import base64
 import io
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from json import JSONDecodeError, loads as json_loads
 from typing import Any, Literal, Union, cast, overload
 
+from anthropic.types import ContentBlock, RedactedThinkingBlock, RedactedThinkingBlockParam, ThinkingBlock, ThinkingBlockParam, ThinkingConfigParam
 from httpx import AsyncClient as AsyncHTTPClient
 from typing_extensions import assert_never
 
@@ -25,6 +26,8 @@ from ..messages import (
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
+    RedactedThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -71,6 +74,7 @@ except ImportError as _import_error:
 LatestAnthropicModelNames = Literal[
     'claude-3-5-haiku-latest',
     'claude-3-5-sonnet-latest',
+    'claude-3-7-sonnet-latest',
     'claude-3-opus-latest',
 ]
 """Latest Anthropic models."""
@@ -88,6 +92,8 @@ class AnthropicModelSettings(ModelSettings):
     """Settings used for an Anthropic model request."""
 
     anthropic_metadata: MetadataParam
+    thinking: ThinkingConfigParam
+
     """An object describing metadata about the request.
 
     Contains `user_id`, an external identifier for the user who is associated with the request."""
@@ -118,6 +124,7 @@ class AnthropicModel(Model):
         api_key: str | None = None,
         anthropic_client: AsyncAnthropic | None = None,
         http_client: AsyncHTTPClient | None = None,
+        default_headers: Mapping[str, str] | None = None,
     ):
         """Initialize an Anthropic model.
 
@@ -137,9 +144,9 @@ class AnthropicModel(Model):
             assert api_key is None, 'Cannot provide both `anthropic_client` and `api_key`'
             self.client = anthropic_client
         elif http_client is not None:
-            self.client = AsyncAnthropic(api_key=api_key, http_client=http_client)
+            self.client = AsyncAnthropic(api_key=api_key, http_client=http_client, default_headers=default_headers)
         else:
-            self.client = AsyncAnthropic(api_key=api_key, http_client=cached_async_http_client())
+            self.client = AsyncAnthropic(api_key=api_key, http_client=cached_async_http_client(), default_headers=default_headers)
 
     async def request(
         self,
@@ -234,6 +241,7 @@ class AnthropicModel(Model):
                 top_p=model_settings.get('top_p', NOT_GIVEN),
                 timeout=model_settings.get('timeout', NOT_GIVEN),
                 metadata=model_settings.get('anthropic_metadata', NOT_GIVEN),
+                thinking=model_settings.get('thinking', NOT_GIVEN),
             )
         except APIStatusError as e:
             if (status_code := e.status_code) >= 400:
@@ -246,6 +254,10 @@ class AnthropicModel(Model):
         for item in response.content:
             if isinstance(item, TextBlock):
                 items.append(TextPart(content=item.text))
+            elif isinstance(item, ThinkingBlock):
+                items.append(ThinkingPart(content=item.thinking, signature=item.signature))
+            elif isinstance(item, RedactedThinkingBlock):
+                items.append(RedactedThinkingPart(data=item.data))
             else:
                 assert isinstance(item, ToolUseBlock), 'unexpected item type'
                 items.append(
@@ -310,10 +322,14 @@ class AnthropicModel(Model):
                         user_content_params.append(retry_param)
                 anthropic_messages.append(MessageParam(role='user', content=user_content_params))
             elif isinstance(m, ModelResponse):
-                assistant_content_params: list[TextBlockParam | ToolUseBlockParam] = []
+                assistant_content_params: list[TextBlockParam | ThinkingBlockParam | RedactedThinkingBlockParam | ToolUseBlockParam] = []
                 for response_part in m.parts:
                     if isinstance(response_part, TextPart):
                         assistant_content_params.append(TextBlockParam(text=response_part.content, type='text'))
+                    elif isinstance(response_part, ThinkingPart):
+                        assistant_content_params.append(ThinkingBlockParam(thinking=response_part.content, signature=response_part.signature, type='thinking'))
+                    elif isinstance(response_part, RedactedThinkingPart):
+                        assistant_content_params.append(RedactedThinkingBlockParam(data=response_part.data, type='redacted_thinking'))
                     else:
                         tool_use_block_param = ToolUseBlockParam(
                             id=_guard_tool_call_id(t=response_part, model_source='Anthropic'),
@@ -423,7 +439,7 @@ class AnthropicStreamedResponse(StreamedResponse):
     _timestamp: datetime
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
-        current_block: TextBlock | ToolUseBlock | None = None
+        current_block: ContentBlock | None = None
         current_json: str = ''
 
         async for event in self._response:
@@ -433,6 +449,10 @@ class AnthropicStreamedResponse(StreamedResponse):
                 current_block = event.content_block
                 if isinstance(current_block, TextBlock) and current_block.text:
                     yield self._parts_manager.handle_text_delta(vendor_part_id='content', content=current_block.text)
+                elif isinstance(current_block, ThinkingBlock):
+                    raise NotImplementedError('Thinking blocks are not supported')
+                elif isinstance(current_block, RedactedThinkingBlock):
+                    raise NotImplementedError('Redacted thinking blocks are not supported')
                 elif isinstance(current_block, ToolUseBlock):
                     maybe_event = self._parts_manager.handle_tool_call_delta(
                         vendor_part_id=current_block.id,

@@ -8,6 +8,7 @@ from datetime import timezone
 from functools import cached_property
 from typing import Any, TypeVar, Union, cast
 
+from anthropic.types import MetadataParam, ThinkingConfigDisabledParam
 import httpx
 import pytest
 from inline_snapshot import snapshot
@@ -437,7 +438,7 @@ async def test_anthropic_specific_metadata(allow_model_requests: None) -> None:
     m = AnthropicModel('claude-3-5-haiku-latest', anthropic_client=mock_client)
     agent = Agent(m)
 
-    result = await agent.run('hello', model_settings=AnthropicModelSettings(anthropic_metadata={'user_id': '123'}))
+    result = await agent.run('hello', model_settings=AnthropicModelSettings(anthropic_metadata=MetadataParam(user_id='123'), thinking=ThinkingConfigDisabledParam(type='disabled')))
     assert result.data == 'world'
     assert get_mock_chat_completion_kwargs(mock_client)[0]['metadata']['user_id'] == '123'
 
